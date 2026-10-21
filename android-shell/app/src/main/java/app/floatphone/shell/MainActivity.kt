@@ -55,7 +55,9 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         val SITE_URL: String = BuildConfig.SITE_URL
-        const val VERSION = "1.0.10"
+        // 与 build.gradle 的 versionName 保持一致：网页侧靠 UA 里的 FloatShell/<版本>
+        // 判断壳能力，版本号写错会让「老壳降级」判断失准。
+        const val VERSION = "1.0.13"
         /** 来电接听等场景的站内深链（必须以 SITE_URL 开头，否则忽略） */
         const val EXTRA_OPEN_URL = "open_url"
         /** 外部 App（如桌宠）唤起本壳用的自定义 scheme：floatshell://open?url=<站内地址> */
@@ -66,6 +68,20 @@ class MainActivity : AppCompatActivity() {
          * 只需要管一个开关。渠道一旦创建过，后建的只更新名称/描述，不会重置用户选择。
          */
         const val CH_MESSAGES = "shell_messages"
+
+        /**
+         * 最近几次「渲染进程被杀后恢复」的时刻 —— 刻意放在 companion object（进程级）。
+         *
+         * 为什么不写成普通字段：恢复靠 recreate()，它会**新建一个 Activity 实例**，
+         * 普通字段随之清零，就永远算不出「一分钟内已经恢复过几次」，
+         * 「被杀 → 重建 → 再被杀」于是变成永不停的闪屏循环。
+         *
+         * 用途只有一个：一分钟内超过 3 次时，把提示换成「请先导出备份再重启」，
+         * 让用户知道该做什么，而不是一脸茫然地看着 App 反复闪。
+         * 恢复动作本身照常执行——把用户留在一个已经死掉的 WebView 上等于给白屏，
+         * 连进设置导出备份都做不到。
+         */
+        private val recoverTimestamps = mutableListOf<Long>()
     }
 
     private lateinit var rootContainer: FrameLayout
@@ -81,6 +97,18 @@ class MainActivity : AppCompatActivity() {
 
     /** 网页消息通知的自增 id：同一条消息覆盖同一 id 会让新通知顶掉旧的，故逐条递增。 */
     private var webNotifId = 500
+
+    /**
+     * 是否正在从「渲染进程被杀」中恢复。
+     *
+     * onRenderProcessGone 可能被连续回调多次（同一个渲染进程死亡会触发多个
+     * WebView 客户端的回调）。不加这道锁会连着 recreate 好几次，用户看到的是
+     * 页面反复闪烁、甚至重建到一半又被下一次回调打断。
+     */
+    private var recoveringFromRenderGone = false
+
+    /** 上一次内存告急时释放缓存的时刻，避免 onTrimMemory 高频回调里反复刷同一套动作。 */
+    private var lastTrimAt = 0L
 
     /** 感知桥：把电量/网络/应用名/步数交给网页（边界说明见 PerceptionBridge）。 */
     private val perception by lazy { PerceptionBridge(this) }
@@ -315,6 +343,66 @@ class MainActivity : AppCompatActivity() {
                     startActivity(Intent(Intent.ACTION_VIEW, url)); true
                 }.getOrDefault(true)
             }
+
+            /**
+             * 渲染进程挂掉时的兜底。**这是「用几分钟就闪退」的直接原因，别删。**
+             *
+             * 网页跑在独立的渲染进程里，内存吃紧时系统会先杀它（不是杀 App）。
+             * 宿主不接这个回调时，框架会继续往一个已死的 WebView 投递消息，
+             * 异常冒到主线程消息循环，表现就是整个 App 无故闪退。
+             *
+             * 这里返回 true 表示「已处理」，阻止框架抛异常；随后销毁残留的
+             * WebView（它已不可用，留着只会持续泄漏并让后续绘制全部失败），
+             * 再重建一次 Activity —— 页面重新加载，用户回到可用状态，
+             * 而不是被弹回桌面。
+             *
+             * detail.didCrash() 为 false 即「被系统因内存不足杀掉」（OOM kill），
+             * 为 true 才是渲染侧真的崩了；两者都走同一条恢复路径。
+             */
+            override fun onRenderProcessGone(
+                view: WebView?,
+                detail: android.webkit.RenderProcessGoneDetail?,
+            ): Boolean {
+                // 同一时刻可能收到多次调用：只处理第一次。
+                if (recoveringFromRenderGone) return true
+                recoveringFromRenderGone = true
+                val oomKilled = detail?.didCrash() == false
+                // 一分钟内已经恢复过 3 次：说明页面会稳定吃爆内存，再重建只会变成
+                // 「闪一下又死」的死循环。此时不再自动重建，留下提示让用户自己
+                // 去导出备份 / 清理，比把他锁在闪屏里好。
+                val now = System.currentTimeMillis()
+                recoverTimestamps.removeAll { now - it > 60_000L }
+                val tooFrequent = recoverTimestamps.size >= 3
+                recoverTimestamps.add(now)
+                runCatching {
+                    Toast.makeText(
+                        this@MainActivity,
+                        if (tooFrequent) "页面反复内存不足，请先导出备份再重启应用" else "页面内存不足，正在恢复…",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                // 必须解除总线引用：否则浮窗/无障碍服务会继续往一个死掉的 WebView 投 JS。
+                if (ShellBus.webView === view) ShellBus.webView = null
+                // 销毁残留实例（不可再用），然后重建 Activity 走一遍 onCreate。
+                runCatching {
+                    (view ?: webView).let {
+                        it.loadUrl("about:blank")
+                        it.destroy()
+                    }
+                }
+                // 稍等一帧再重建：让上面的 destroy 与系统回收有机会先跑完，
+                // 立刻 recreate 会和正在进行的销毁撞在一起（偶发白屏）。
+                // 即使 tooFrequent 也照样重建：把用户留在一个已经死掉的 WebView 上
+                // 等于给他一块白屏，连「去设置里导出备份」都做不到。
+                // 频繁时只是换一句提示，告诉他该清理什么。
+                rootContainer.postDelayed({
+                    runCatching { recreate() }
+                }, 240L)
+                if (BuildConfig.DEBUG) {
+                    android.util.Log.w("FloatShell", "render process gone (oomKilled=$oomKilled)")
+                }
+                return true
+            }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
@@ -542,10 +630,57 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        if (ShellBus.webView === webView) ShellBus.webView = null
-        CookieManager.getInstance().flush()
-        webView.destroy()
+        // 已经走过一次恢复流程时，WebView 早已销毁，这里不能再碰它（会抛 IllegalStateException）。
+        // onCreate 中途失败时也可能没建起来，lateinit 未初始化同样要跳过。
+        val canTouchWebView = ::webView.isInitialized && !recoveringFromRenderGone
+        if (canTouchWebView && ShellBus.webView === webView) ShellBus.webView = null
+        runCatching { CookieManager.getInstance().flush() }
+        // 退出时主动清一次 WebView 自己的内存缓存（磁盘缓存保留，否则每次冷启都要重新下资源）。
+        // 不调用 freeMemory()：它会连带释放页面里正在用的位图，退出瞬间的绘制会花屏。
+        if (canTouchWebView) {
+            runCatching { webView.clearCache(false) }
+            runCatching { webView.destroy() }
+        }
         super.onDestroy()
+    }
+
+    /**
+     * 系统内存紧张时主动减负。**这是「先卡顿、再闪退」链路的刹车。**
+     *
+     * 为什么需要：本页是长驻的重型单页应用（聊天列表、图片、动画全在内存里），
+     * 系统给 WebView 渲染进程的配额有限。等系统自己动手就是直接杀渲染进程
+     * （见 onRenderProcessGone 那条路），用户感受到的是卡顿后闪退。
+     * 在这里提前把手上的非必要内存交回去，多数情况下能避免走到那一步。
+     *
+     * 只做一件确定安全的事：释放 WebView 的内存缓存。
+     * 不动磁盘缓存、不动 localStorage/IndexedDB —— 聊天记录与角色卡都存在后者里，
+     * 一个字节都不会丢。
+     *
+     * 刻意**不**调用 freeMemory()：那会把页面正在显示的位图也置空，
+     * 聊天里的图片会变成一片空白，用户以为数据坏了。
+     * 也刻意不碰 ActivityManager 的数据清理接口（清用户数据 = 删档）。
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // 只对「明显吃紧」的级别动手，避免每次切后台都跑一遍。
+        val critical = level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
+        if (!critical) return
+        // onCreate 之前也可能收到（Activity 已实例化但还没建 WebView），此时无物可清。
+        if (!::webView.isInitialized) return
+        val now = System.currentTimeMillis()
+        if (now - lastTrimAt < 5_000L) return
+        lastTrimAt = now
+        runCatching { webView.clearCache(false) }
+    }
+
+    /**
+     * 低内存兜底。与 onTrimMemory 同源，但这是更老的 API（Android 4 之前就有），
+     * 部分 ROM 只派发这一个。动作保持一致：只清缓存，不动持久化数据。
+     */
+    override fun onLowMemory() {
+        super.onLowMemory()
+        if (!::webView.isInitialized) return
+        runCatching { webView.clearCache(false) }
     }
 
     /** 暴露给网页的原生桥（网页侧可用 window.AndroidShell 特性检测壳环境）。 */
@@ -556,6 +691,41 @@ class MainActivity : AppCompatActivity() {
         /** 实测系统状态栏高度（CSS px）。页面侧兜底轮询用；主要注入路径见 injectStatusBarHeight。 */
         @JavascriptInterface
         fun getStatusBarHeightPx(): Int = statusBarHeightCssPx
+
+        /**
+         * 本进程的内存状况（JSON），供网页侧做「内存紧张就降载」的判断。
+         *
+         * 字段：
+         *   heapUsedMb / heapMaxMb / heapPercent —— 本进程 Java 堆用量与上限；
+         *   largeHeap                            —— 是否拿到了大堆（见 AndroidManifest）；
+         *   lowMemory                            —— 系统当前是否已进入低内存状态；
+         *   maxMemoryMb                          —— Runtime 报告的单进程可用上限。
+         *
+         * 网页侧可以这样用（可选，壳老版本没有这个方法，要做特性检测）：
+         *   const raw = window.AndroidShell?.getMemoryInfo?.();
+         *   if (raw && JSON.parse(raw).heapPercent > 80) { 关掉动画 / 清图片缓存 }
+         *
+         * 注意这是 **Java 堆**的用量，不含 WebView 渲染进程（网页本身）的占用——
+         * 那部分读不到，只能靠 onRenderProcessGone 事后感知。所以这里的数值
+         * 偏低是正常的，别把它当成「网页内存还够」的证据。
+         */
+        @JavascriptInterface
+        fun getMemoryInfo(): String = runCatching {
+            val runtime = Runtime.getRuntime()
+            val used = runtime.totalMemory() - runtime.freeMemory()
+            val max = runtime.maxMemory()
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val info = android.app.ActivityManager.MemoryInfo()
+            am.getMemoryInfo(info)
+            org.json.JSONObject()
+                .put("heapUsedMb", used / (1024 * 1024))
+                .put("heapMaxMb", max / (1024 * 1024))
+                .put("heapPercent", if (max > 0) (used * 100 / max).toInt() else 0)
+                .put("maxMemoryMb", runtime.maxMemory() / (1024 * 1024))
+                .put("largeHeap", am.isLowRamDevice.not() && (max / (1024 * 1024)) > 256)
+                .put("lowMemory", info.lowMemory)
+                .toString()
+        }.getOrDefault("{}")
 
         // ── 感知桥（电量 / 网络 / 应用名）────────────────
         // 只读、零判断、不抛异常。所有「要不要上报」的逻辑在网页侧，
@@ -1304,14 +1474,20 @@ class MainActivity : AppCompatActivity() {
         }.getOrNull()
     }
 
-    /** 解 data:image/png;base64,xxxx 形式的头像。 */
+    /**
+     * 解 data:image/png;base64,xxxx 形式的头像。
+     *
+     * 必须走 BitmapSafe 的限尺寸解码：内联头像可能是原图（几 MB base64 → 
+     * 三四十 MB 位图），而通知只要几十像素。以前这里全尺寸解码，
+     * 每发一条消息白扔几十 MB，是「几分钟后 OOM 闪退」的主要来源之一。
+     */
     private fun decodeDataUrlBitmap(dataUrl: String): Bitmap? = runCatching {
         val comma = dataUrl.indexOf(',')
         if (comma < 0) return@runCatching null
         val header = dataUrl.substring(0, comma)
         if (!header.contains("base64", ignoreCase = true)) return@runCatching null
         val bytes = Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        BitmapSafe.decodeSampled(bytes)
     }.getOrNull()
 
     /** 拉取远程头像。站点可能要求登录 Cookie，这里带上；失败返回 null。 */
@@ -1323,7 +1499,8 @@ class MainActivity : AppCompatActivity() {
         avatarClient.newCall(builder.build()).execute().use { response ->
             if (!response.isSuccessful) return@runCatching null
             val bytes = response.body?.bytes() ?: return@runCatching null
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            // 同样是限尺寸解码：直链头像常是原尺寸大图。
+            BitmapSafe.decodeSampled(bytes)
         }
     }.getOrNull()
 

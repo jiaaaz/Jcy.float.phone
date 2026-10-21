@@ -439,14 +439,20 @@ class PushService : Service() {
         }.getOrNull()
     }
 
-    /** 解 data:image/png;base64,xxxx 形式的内联头像。 */
+    /**
+     * 解 data:image/png;base64,xxxx 形式的内联头像。
+     *
+     * 走 BitmapSafe 限尺寸解码：广播里的头像可能是原图（几 MB base64），
+     * 全尺寸解码一张就能吃掉几十 MB 堆内存。推送服务是常驻的，
+     * 每条离线消息都解一次原图，几轮下来整个 App 就被系统按 OOM 杀掉。
+     */
     private fun decodeDataUrlBitmap(dataUrl: String): Bitmap? = runCatching {
         val comma = dataUrl.indexOf(',')
         if (comma < 0) return@runCatching null
         val header = dataUrl.substring(0, comma)
         if (!header.contains("base64", ignoreCase = true)) return@runCatching null
         val bytes = Base64.decode(dataUrl.substring(comma + 1), Base64.DEFAULT)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        BitmapSafe.decodeSampled(bytes)
     }.getOrNull()
 
     /** 拉取远程头像。可能是站点上的受保护资源，这里带上 WebView 的登录 Cookie；失败返回 null。 */
@@ -458,7 +464,8 @@ class PushService : Service() {
         avatarClient.newCall(builder.build()).execute().use { response ->
             if (!response.isSuccessful) return@runCatching null
             val bytes = response.body?.bytes() ?: return@runCatching null
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            // 直链头像常是原尺寸大图，同样限尺寸解码。
+            BitmapSafe.decodeSampled(bytes)
         }
     }.getOrNull()
 

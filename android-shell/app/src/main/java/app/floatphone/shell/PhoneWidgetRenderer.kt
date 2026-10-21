@@ -128,9 +128,49 @@ object PhoneWidgetRenderer {
     fun renderAndPush(context: Context, html: String, widthDp: Int, heightDp: Int, scale: Int) {
         val appContext = context.applicationContext
         saveHtml(appContext, html)
+        // ★ 必须串行：每次渲染都要新建一个离屏 WebView + 一张 MAX_DIMEN 级位图
+        // （1200×600 ARGB_8888 ≈ 2.9MB，加上 WebView 自己的渲染层往往翻倍）。
+        // 原来每来一次请求就直接 post 一轮渲染，网页连推几次（改配色、换模板、
+        // 调尺寸很容易连发）就会在主线程上叠出好几套离屏 WebView 与位图，
+        // 表现正是实测反馈的「几分钟后开始卡、然后闪退」。
+        // 这里把请求折叠：同一时刻只跑一个，跑的过程中来的请求只记住最后一份参数，
+        // 跑完再补一次——既不堆积，也不会丢掉用户最后一次设置。
+        pendingHtml = html
+        pendingSize = Triple(widthDp, heightDp, scale)
+        // 统一 post 回主线程再判断要不要开跑：
+        // 本方法由 @JavascriptInterface 从 JavaBridge 线程调用，而 WebView 只能在
+        // 主线程创建/操作。把「入队」与「开跑」都放进同一个主线程消息里，
+        // renderInFlight 的读与写才不会跨线程打架。
         Handler(Looper.getMainLooper()).post {
-            renderToFile(appContext, html, widthDp, heightDp, scale) {
-                PhoneWidgetProvider.updateAll(appContext)
+            if (renderInFlight) return@post
+            drainRenderQueue(appContext)
+        }
+    }
+
+    /** 串行队列的「下一份待渲染内容」；null = 没有待办。 */
+    @Volatile private var pendingHtml: String? = null
+
+    /** 待渲染内容对应的尺寸（与 [pendingHtml] 一起被覆盖为最新值）。 */
+    @Volatile private var pendingSize: Triple<Int, Int, Int>? = null
+
+    /**
+     * 依次消化排队的渲染请求。必须在主线程调用。
+     *
+     * 只串行、不合并同一份内容：用户最后设置的尺寸/模板一定要落到桌面上，
+     * 所以队列里保留的是「最新一份」，中间过程可以跳过。
+     */
+    private fun drainRenderQueue(context: Context) {
+        val html = pendingHtml
+        val size = pendingSize
+        if (html == null || size == null) return
+        pendingHtml = null
+        pendingSize = null
+        renderToFile(context, html, size.first, size.second, size.third) {
+            PhoneWidgetProvider.updateAll(context)
+            // 渲染期间又来了新请求：继续消化，直到队列空。
+            // （用 post 而不是直接递归，避免极端情况下连续请求把栈堆深。）
+            if (pendingHtml != null) {
+                Handler(Looper.getMainLooper()).post { drainRenderQueue(context) }
             }
         }
     }

@@ -108,11 +108,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!-- android:largeHeap="true"：把本进程的堆上限从默认的 192~256MB 抬到 512MB 左右。
+         本壳是个全屏重型单页应用（聊天列表、图片、动画），默认堆在低端机上几分钟就能
+         撞到顶，届时系统直接杀 WebView 渲染进程 → 表现为「卡一下然后闪退」。
+         配合 MainActivity.onRenderProcessGone / onTrimMemory 一起用：
+         前者让被杀后能自动恢复，后者尽量不走到那一步。 -->
     <application
         android:label="@string/app_name"
         android:icon="@drawable/appicon"
         android:allowBackup="true"
         android:supportsRtl="true"
+        android:largeHeap="true"
         android:usesCleartextTraffic="false"
         android:theme="@style/Theme.FloatShell">
 
