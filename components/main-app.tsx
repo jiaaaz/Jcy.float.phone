@@ -13,6 +13,7 @@ import { ShellPushRegistrar } from "@/components/shell-push-registrar";
 import { DesktopShell } from "./desktop-shell";
 import { OfflinePushRevampAnnouncement } from "./offline-push-revamp-announcement";
 import { SplashAnimation } from "./splash-animation";
+import { LayoutDiagnostic } from "./layout-diagnostic";
 import { MusicProvider } from "@/lib/music-context";
 import { hydrateKvDb, isKvHydrated } from "@/lib/kv-db";
 import { getThemeAssetMap, readThemeProfile } from "@/lib/theme-storage";
@@ -330,6 +331,8 @@ export function MainApp() {
             <MediaMaintenanceScheduler />
             {/* 壳推送订阅的兜底注册：壳原生那次失败是静默的，这里可验证地补一次 */}
             <ShellPushRegistrar />
+            {/* 临时布局诊断：仅在 URL 带 ?layoutdiag=1 时显示，定位完可整块删除 */}
+            <LayoutDiagnostic />
           </MusicProvider>
         </main>
       )}
