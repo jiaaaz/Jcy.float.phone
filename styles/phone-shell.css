@@ -3,6 +3,14 @@
 .phone-shell-wrap {
   --phone-total-width: calc(var(--phone-screen-width) + (2 * (var(--phone-frame-size) + var(--phone-case-padding) + var(--phone-case-border-size))));
   display: grid;
+  /* 单列显式声明为 minmax(0, 1fr)。此前不声明列，隐式列按 auto 排版，而 auto 的
+     下限是「内容最小宽度」——桌面态里 .phone-swipe-layer 是横向排开的 3 页、
+     每页 flex-shrink:0，三页最小宽度相加会把这一列撑到视口的三倍（实测
+     365px 视口下这一列被撑成 909px ≈ 3 × 303px），机身随之变宽、溢出被
+     .app-root 的 overflow:hidden 裁掉，肉眼就是「图标整体偏右、只能看到
+     五分之一」。minmax(0, 1fr) 把下限压到 0，列宽严格等于容器宽度。
+     桌面视口下 1fr 仍是满宽，观感零变化。 */
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
   width: calc(var(--phone-total-width) + 8px);
   margin-inline: auto;
@@ -270,6 +278,8 @@
   margin-top: var(--home-grid-top-offset);
   flex: 1 1 auto;
   min-height: 0;
+  /* 同 .phone-swipe-layer：不让 flex 子项按内容最小宽度撑开，见上方说明。 */
+  min-width: 0;
   display: flex;
   flex-direction: column;
   z-index: 2;
@@ -295,6 +305,10 @@
 .phone-swipe-layer {
   flex: 1 1 auto;
   min-height: 0;
+  /* 与 min-width 成对：flex 子项的自动最小尺寸是「内容最小宽度」，不允许收缩。
+     桌面态这里是 3 个 flex:0 0 100% 的整页并排，不让收缩就会被撑成三倍宽，
+     撑大整条链路（workspace → shell → wrap）。压到 0 后宽度严格跟随父级。 */
+  min-width: 0;
   display: flex;
   flex-direction: row;
   width: 100%;
