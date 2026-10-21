@@ -492,9 +492,15 @@ export function getActiveChatSessionId(): string | null {
 }
 
 export function markChatSessionRead(sessionId: string): void {
-    const session = _sessionsCache.find(item => item.id === sessionId);
-    if (!session || session.unreadCount === 0) return;
-    session.unreadCount = 0;
+    const idx = _sessionsCache.findIndex(item => item.id === sessionId);
+    if (idx === -1) return;
+    if (_sessionsCache[idx].unreadCount === 0) return;
+    // 换新对象而不是原地改 unreadCount：loadChatSessions 的短路判断看的是数组引用，
+    // 原地改字段会让它继续返回「已校验」的旧状态，未读角标清不掉。
+    const session = { ..._sessionsCache[idx], unreadCount: 0 };
+    _sessionsCache = _sessionsCache.slice();
+    _sessionsCache[idx] = session;
+    _sessionsCacheCleanSource = null;
     dbPutSessions([session]);
     if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("chat-messages-updated", { detail: { sessionId } }));
@@ -530,12 +536,24 @@ function resolvePendingAvatarRecommendation(message: ChatMessage): void {
     const declined = explicitDeclined || inferredDecision === "declined";
     if (!accepted && !declined) return;
 
-    recommendation.mediaData = {
-        ...recommendation.mediaData,
-        avatarRecommendationForCharacterId: session.contactId,
-        avatarRecommendationStatus: accepted ? "accepted" : "declined",
+    // 同上：把改动写成新对象再写回 _messagesCache，别原地改 recommendation.mediaData。
+    // 这个对象可能正被会话索引共享着，原地改会让索引里的旧引用「看起来」也变了、
+    // 但索引本身不会重建，读到哪一份纯看运气。
+    const recIdx = _messagesCache.findIndex(item => item.id === recommendation.id);
+    const nextRecommendation: ChatMessage = {
+        ...recommendation,
+        mediaData: {
+            ...recommendation.mediaData,
+            avatarRecommendationForCharacterId: session.contactId,
+            avatarRecommendationStatus: accepted ? "accepted" : "declined",
+        },
     };
-    dbPutMessage(recommendation);
+    if (recIdx !== -1) {
+        _messagesCache = _messagesCache.slice();
+        _messagesCache[recIdx] = nextRecommendation;
+        invalidateSessionMessagesIndex();
+    }
+    dbPutMessage(nextRecommendation);
 
     if (accepted && recommendation.mediaUrl) {
         const characters = loadCharacters();
@@ -757,16 +775,51 @@ export function compareChatMessages(a: ChatMessage, b: ChatMessage): number {
     return a.id.localeCompare(b.id);
 }
 
+// ── 会话级消息索引缓存 ──────────────────────────────
+//
+// 为什么必须有它（改之前先读）：
+//   getSortedSessionMessages 原来是「filter 全表 + sort」——每次调用都是 O(n log n)。
+//   而它被 getLastVisibleSessionMessage 调用，后者又出现在
+//   getSessionActivityTime → isPreferredSession → normalizeChatSessions 这条链上，
+//   于是**每渲染一次会话列表**就要对全部消息排序好几轮。消息攒到几千条、
+//   会话几十个时，一次列表渲染就是几十万次比较，主线程直接卡住。
+//   实测反馈的「用几分钟开始卡、越用越卡」正是这条链。
+//
+// 策略：按 sessionId 分组后缓存，缓存失效只在消息数组真正变动时发生。
+// 缓存的是**已排序**的数组，读路径变成 O(1) 取引用。
+// 注意：缓存里的数组不要原地改（调用方一律只读；改动都走 _messagesCache 重建）。
+function getSessionMessagesIndex(): Map<string, ChatMessage[]> {
+    const source = _messagesCache;
+    if (
+        _sessionMessagesIndex
+        && _sessionMessagesIndexSource === source
+        && _sessionMessagesIndexLength === source.length
+    ) {
+        return _sessionMessagesIndex;
+    }
+    const grouped = new Map<string, ChatMessage[]>();
+    for (const message of source) {
+        const bucket = grouped.get(message.sessionId);
+        if (bucket) bucket.push(message);
+        else grouped.set(message.sessionId, [message]);
+    }
+    // 只在建索引时排一次序；后续所有读取都复用这份结果。
+    for (const bucket of grouped.values()) bucket.sort(compareChatMessages);
+    _sessionMessagesIndex = grouped;
+    _sessionMessagesIndexSource = source;
+    _sessionMessagesIndexLength = source.length;
+    return grouped;
+}
+
 function getSortedSessionMessages(sessionId: string): ChatMessage[] {
-    return _loadAllMessages()
-        .filter(m => m.sessionId === sessionId)
-        .sort(compareChatMessages);
+    return getSessionMessagesIndex().get(sessionId) ?? [];
 }
 
 function getNextMessageOrder(sessionId: string): number {
+    // 走会话索引，不再遍历全表：批量导入几千条消息时，这里原来会被调用几千次、
+    // 每次扫一遍全表，直接退化成 O(n²)。
     let maxOrder = -1;
-    for (const msg of _messagesCache) {
-        if (msg.sessionId !== sessionId) continue;
+    for (const msg of getSortedSessionMessages(sessionId)) {
         const order = getStableMessageOrder(msg);
         if (order !== null && order > maxOrder) maxOrder = order;
     }
@@ -818,6 +871,13 @@ export function reindexSessionMessageOrdersByTime(sessionId: string): void {
     }
 }
 
+/**
+ * 会话里最后一条「能在列表里当预览」的消息。
+ *
+ * 走会话索引（已按 compareChatMessages 排好序），所以这里是纯倒序遍历，
+ * 不再 filter + sort。这个函数在会话列表渲染路径上是高频调用点
+ * （见 getSessionActivityTime），原来每调一次都要排一遍全表消息。
+ */
 export function getLastVisibleSessionMessage(sessionId: string): ChatMessage | null {
     const messages = getSortedSessionMessages(sessionId);
     for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -844,6 +904,45 @@ let _sessionsCache: ChatSession[] = [];
 let _messagesCache: ChatMessage[] = [];
 let _hydrated = false;
 let _hydratePromise: Promise<void> | null = null;
+
+/**
+ * 上一次「确认已归一化」的 _sessionsCache 引用（loadChatSessions 的短路依据）。
+ *
+ * 放在这里而不是紧挨着 loadChatSessions：markChatSessionRead 等函数（在上面）
+ * 也要把它的值清掉。虽然模块顶层执行顺序上不会真的踩到 TDZ，但声明与使用点
+ * 隔了上千行、跨了多个函数，放到缓存变量这一组里才不会被后来的人改出问题。
+ */
+let _sessionsCacheCleanSource: ChatSession[] | null = null;
+
+// ── 会话级消息索引缓存（状态）──────────────────────
+//
+// 为什么需要它：getSortedSessionMessages 原来是「filter 全表 + sort」，每次
+// O(n log n)。而它被 getLastVisibleSessionMessage 调用，后者又在
+// getSessionActivityTime → isPreferredSession → normalizeChatSessions 这条链上，
+// 于是每渲染一次会话列表就要对全部消息排序好几轮。消息攒到几千条、会话几十个时
+// 一次列表渲染就是几十万次比较，主线程直接卡住——「用几分钟越来越卡」正源于此。
+//
+// 缓存的是一份**已按 compareChatMessages 排好序**的分组结果，读路径变成 O(1)。
+// 这里只存状态与作废入口；分组逻辑在 getSessionMessagesIndex（见下）。
+let _sessionMessagesIndex: Map<string, ChatMessage[]> | null = null;
+/**
+ * 建索引时的 _messagesCache 引用。
+ *
+ * ⚠️ 只比引用是不够的：pushChatMessage 用的是 `_messagesCache.push(newMsg)`
+ * ——原地追加，引用不变。只按引用判断脏，新消息就永远进不了索引，
+ * 表现是「刚发的消息在列表里看不见、会话预览不更新」这种极难查的数据 bug。
+ * 所以同时记录长度，引用或长度任一变化都重建。
+ */
+let _sessionMessagesIndexSource: ChatMessage[] | null = null;
+/** 建索引时的消息条数（原地 push 不改引用，靠它兜住）。 */
+let _sessionMessagesIndexLength = -1;
+
+/** 显式作废索引。凡是「原地改动 _messagesCache 元素」的地方都该调一次。 */
+function invalidateSessionMessagesIndex(): void {
+    _sessionMessagesIndex = null;
+    _sessionMessagesIndexSource = null;
+    _sessionMessagesIndexLength = -1;
+}
 
 type NormalizedList<T> = { items: T[]; changed: boolean };
 type NormalizedSessionList = NormalizedList<ChatSession> & { redirects: Map<string, string> };
@@ -1317,7 +1416,53 @@ export function removeChatContact(characterId: string) {
 }
 
 // ── CRUD for Sessions ─────────────────────────
+/**
+ * 读会话列表（内存缓存）。
+ *
+ * ⚠️ 这是全应用最热的读路径之一：桌面、聊天列表、未读角标、推送、感知引擎
+ * 都在调它。原来的实现**每次调用**都跑三遍全量扫描：
+ *   ① normalizeChatSessions —— 每个会话都要算一次活跃时间，
+ *      而算活跃时间要取该会话最后一条可见消息；
+ *   ② redirectMessagesToPreferredSessions —— 全表消息扫一遍；
+ *   ③ refreshSessionPreviewMetadata —— 又对每个会话取一次最后一条可见消息。
+ * 会话几十个、消息几千条时，一次调用就是几十万次比较。它被高频调用，
+ * 于是「用几分钟越来越卡」——实测反馈的卡顿主因就在这里。
+ *
+ * 现在：
+ *   · 消息侧取最后一条走会话索引（见 getSessionMessagesIndex），不再每次排序；
+ *   · 数据没被改过时（_sessionsCache 与上次校验时同一个引用、且校验结论是「干净」）
+ *     直接返回缓存，一轮扫描都不做。
+ *
+ * 短路的安全性：normalizeChatSessions / refreshSessionPreviewMetadata 对干净数据
+ * 都是幂等的（返回 changed=false 且 items 内容等价）。所以「上次校验干净 + 之后
+ * 没人改过 _sessionsCache 引用」⇒ 这次校验必然也干净，跳过不影响结果。
+ * 任何写路径都会把 _sessionsCache 换成新数组（见 saveChatSessions），引用一变
+ * 就自动重跑，不会漏掉改动。
+ */
+/**
+ * 取一份**可以随便改**的会话数组副本。
+ *
+ * 为什么需要（重要）：loadChatSessions() 返回的是 _sessionsCache 本身。
+ * 全代码里大量存在这种写法：
+ *     const sessions = loadChatSessions();
+ *     sessions[idx].lastMessagePreview = preview;   // ← 改的就是缓存里的对象
+ *     saveChatSessions(sessions);
+ * 在没有短路缓存的年代这没问题（下次 load 会重算）。现在 loadChatSessions 靠
+ * 「引用没变 ⇒ 上次校验过就是干净的」短路，而上面这种原地改字段既不动数组引用
+ * 也不换对象，短路会把旧状态一直返回出去——预览不更新、未读数不涨。
+ *
+ * 所以凡是「读了要改再存回去」的调用点，都应该用这个函数拿到浅拷贝后的数组
+ * （元素也换成新对象），这样 saveChatSessions 拿到的是一份真正的新数据。
+ */
+function loadChatSessionsForWrite(): ChatSession[] {
+    return loadChatSessions().map(session => ({ ...session }));
+}
+
 export function loadChatSessions(): ChatSession[] {
+    if (_sessionsCacheCleanSource === _sessionsCache) {
+        // 上次校验过、之后没有写入过 → 无需重复归一化。
+        return _sessionsCache;
+    }
     const normalized = normalizeChatSessions(_sessionsCache);
     const redirectedMessages = redirectMessagesToPreferredSessions(normalized.redirects);
     const refreshed = refreshSessionPreviewMetadata(normalized.items);
@@ -1325,6 +1470,9 @@ export function loadChatSessions(): ChatSession[] {
         _sessionsCache = refreshed.items;
         if (_hydrated && typeof window !== "undefined") dbReplaceSessions(refreshed.items);
     }
+    // 记下「这个引用已经是干净状态」。注意必须在可能替换 _sessionsCache 之后取，
+    // 否则记的是旧引用，下次会白白重跑一遍。
+    _sessionsCacheCleanSource = _sessionsCache;
     return _sessionsCache;
 }
 
@@ -1333,6 +1481,11 @@ export function saveChatSessions(sessions: ChatSession[]) {
     const redirectedMessages = redirectMessagesToPreferredSessions(normalized.redirects);
     const refreshed = refreshSessionPreviewMetadata(normalized.items);
     _sessionsCache = refreshed.items;
+    // 这里刚做完一轮归一化+预览刷新，结果就是干净的：直接把「已校验」标记打到
+    // 新数组上，省掉紧接着那次 loadChatSessions（save 后往往立刻 load）的全量重算。
+    // 若前面发生了消息重定向，消息侧已变，让索引与标记都重来一遍更稳妥。
+    if (redirectedMessages > 0) invalidateSessionMessagesIndex();
+    _sessionsCacheCleanSource = _sessionsCache;
     if (!_hydrated && typeof window !== "undefined") {
         console.warn("[ChatStorage] saveChatSessions before hydration; using additive write to avoid replacing existing sessions.");
         dbPutSessions(refreshed.items);
@@ -1409,10 +1562,18 @@ export function reassignChatSessionMessages(fromSessionId: string, toSessionId: 
 }
 
 // ── CRUD for Messages ─────────────────────────
+/**
+ * 读某会话的消息（已按时间/order 排序）。
+ *
+ * ⚠️ 必须返回**副本**：底层 getSortedSessionMessages 现在返回的是会话索引里的
+ * 共享数组（缓存），直接把它交给调用方，任何一次 reverse()/sort()/splice()
+ * 都会永久污染缓存，且症状极其隐蔽（某些会话消息顺序错乱、偶发丢消息）。
+ * 历史上这里就是返回原数组的，加了缓存之后这层拷贝从「浪费」变成「必须」。
+ */
 export function loadChatMessages(sessionId: string, limit?: number): ChatMessage[] {
     const all = getSortedSessionMessages(sessionId);
     if (limit && limit < all.length) return all.slice(-limit);
-    return all;
+    return all.slice();
 }
 
 function createMessageId(): string {
@@ -1461,6 +1622,9 @@ export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "sta
     }
 
     _messagesCache.push(newMsg);
+    // push 是原地追加（引用不变、长度变），索引靠长度校验能发现；
+    // 但把作废写在这里，语义更明确，也不依赖「长度一定变」这个隐含前提。
+    invalidateSessionMessagesIndex();
     dbPutMessage(newMsg);
     resolvePendingAvatarRecommendation(newMsg);
 
@@ -1470,17 +1634,25 @@ export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "sta
     const preview = getChatMessagePreview(newMsg);
     const sessIdx = _sessionsCache.findIndex(s => s.id === msg.sessionId);
     if (sessIdx !== -1 && isSessionPreviewCandidate(newMsg)) {
-        const target = _sessionsCache[sessIdx];
-        target.lastMessageId = newMsg.id;
-        if (preview) target.lastMessagePreview = preview;
-        target.updatedAt = newMsg.createdAt;
-        if (
-            newMsg.role === "assistant"
-            && (_activeChatSessionId !== newMsg.sessionId
-                || (typeof document !== "undefined" && document.visibilityState !== "visible"))
-        ) {
-            target.unreadCount = Math.max(0, target.unreadCount || 0) + 1;
-        }
+        // ⚠️ 这里必须换成**新对象**再写回数组，不能原地改 target 的字段。
+        // 原因：loadChatSessions 现在靠「_sessionsCache 引用没变 ⇒ 上次校验过就是干净的」
+        // 短路，原地改字段不会换引用，短路会把旧的预览/未读数一直返回出去，
+        // 表现为「发了消息但列表不更新、未读数不涨」。
+        const target = {
+            ..._sessionsCache[sessIdx],
+            lastMessageId: newMsg.id,
+            lastMessagePreview: preview || _sessionsCache[sessIdx].lastMessagePreview,
+            updatedAt: newMsg.createdAt,
+            unreadCount: newMsg.role === "assistant"
+                && (_activeChatSessionId !== newMsg.sessionId
+                    || (typeof document !== "undefined" && document.visibilityState !== "visible"))
+                ? Math.max(0, (_sessionsCache[sessIdx].unreadCount || 0) + 1)
+                : _sessionsCache[sessIdx].unreadCount,
+        };
+        _sessionsCache = _sessionsCache.slice();
+        _sessionsCache[sessIdx] = target;
+        // 换了引用，短路标记自然失效；这里显式清一下，避免读代码时误以为还「干净」。
+        _sessionsCacheCleanSource = null;
         dbPutSessions([target]);
     } else if (sessIdx === -1) {
         // 缓存未命中（极端情况）：回退全量路径，保证列表预览仍会刷新
@@ -1827,7 +1999,8 @@ export function deleteChatMessage(messageId: string) {
     // Recalculate the last message for the session to update the preview
     const lastMsg = getLastVisibleSessionMessage(sessionId);
 
-    const sessions = loadChatSessions();
+    // ForWrite：要改会话字段，必须拿可改的副本（见 loadChatSessionsForWrite 注释）。
+    const sessions = loadChatSessionsForWrite();
     const sessIdx = sessions.findIndex(s => s.id === sessionId);
     if (sessIdx !== -1) {
         if (lastMsg) {
@@ -1862,7 +2035,8 @@ export function deleteChatMessagesFrom(messageId: string) {
 
     const lastMsg = getLastVisibleSessionMessage(sessionId);
 
-    const sessions = loadChatSessions();
+    // ForWrite：要改会话字段，必须拿可改的副本（见 loadChatSessionsForWrite 注释）。
+    const sessions = loadChatSessionsForWrite();
     const sessIdx = sessions.findIndex(s => s.id === sessionId);
     if (sessIdx !== -1) {
         if (lastMsg) {
@@ -1896,7 +2070,8 @@ export function deleteChatMessagesByIds(sessionId: string, messageIds: string[])
     reindexSessionMessageOrders(sessionId);
 
     const lastMsg = getLastVisibleSessionMessage(sessionId);
-    const sessions = loadChatSessions();
+    // ForWrite：要改会话字段，必须拿可改的副本（见 loadChatSessionsForWrite 注释）。
+    const sessions = loadChatSessionsForWrite();
     const sessIdx = sessions.findIndex(s => s.id === sessionId);
     if (sessIdx !== -1) {
         if (lastMsg) {
@@ -1918,12 +2093,16 @@ export function editChatMessage(messageId: string, newContent: string) {
     const msgIdx = _messagesCache.findIndex(m => m.id === messageId);
     if (msgIdx !== -1) {
         _messagesCache[msgIdx] = { ..._messagesCache[msgIdx], content: newContent };
+        // 下标赋值只换元素、不动数组引用与长度：靠引用/长度判断脏的话，
+        // 会话索引里还是编辑前的旧对象，聊天列表预览不会更新。
+        invalidateSessionMessagesIndex();
         dbPutMessage(_messagesCache[msgIdx]);
 
         const sessionId = _messagesCache[msgIdx].sessionId;
         const lastMsg = getLastVisibleSessionMessage(sessionId);
 
-        const sessions = loadChatSessions();
+        // ForWrite：下面要改会话预览字段（见 loadChatSessionsForWrite 注释）。
+        const sessions = loadChatSessionsForWrite();
         const sessIdx = sessions.findIndex(s => s.id === sessionId);
         if (sessIdx !== -1 && lastMsg && sessions[sessIdx].lastMessageId === lastMsg.id) {
             sessions[sessIdx].lastMessagePreview = getChatMessagePreview(lastMsg);
@@ -1936,12 +2115,15 @@ export function retractChatMessage(messageId: string) {
     const msgIdx = _messagesCache.findIndex(m => m.id === messageId);
     if (msgIdx !== -1) {
         _messagesCache[msgIdx] = { ..._messagesCache[msgIdx], isRetracted: true };
+        // 同上：下标赋值不改引用/长度，必须显式作废索引。
+        invalidateSessionMessagesIndex();
         dbPutMessage(_messagesCache[msgIdx]);
 
         const sessionId = _messagesCache[msgIdx].sessionId;
         const lastMsg = getLastVisibleSessionMessage(sessionId);
 
-        const sessions = loadChatSessions();
+        // ForWrite：下面要改会话预览字段（见 loadChatSessionsForWrite 注释）。
+        const sessions = loadChatSessionsForWrite();
         const sessIdx = sessions.findIndex(s => s.id === sessionId);
         if (sessIdx !== -1 && lastMsg && sessions[sessIdx].lastMessageId === lastMsg.id) {
             sessions[sessIdx].lastMessagePreview = "撤回了一条消息";
@@ -2048,7 +2230,9 @@ export function clearChatSessionToolHistory(sessionId: string): ClearChatSession
     if (deletedIds.size > 0) reindexSessionMessageOrders(sessionId);
 
     const lastMsg = getLastVisibleSessionMessage(sessionId);
-    const sessions = loadChatSessions();
+    // 用 ForWrite 版本：下面要改会话字段，直接改 loadChatSessions 返回的缓存对象
+    // 不会换引用，会被短路判断当成「未变更」（见 loadChatSessionsForWrite 注释）。
+    const sessions = loadChatSessionsForWrite();
     const sessIdx = sessions.findIndex(s => s.id === sessionId);
     if (sessIdx !== -1) {
         if (lastMsg) {
@@ -2167,6 +2351,8 @@ export async function persistMessageVoiceAudio(
             mediaData: { ..._messagesCache[idx].mediaData, synthesizedFromText },
         };
         _messagesCache[idx] = next;
+        // 下标赋值：作废会话索引，否则刚合成的语音在列表/预览里读不到。
+        invalidateSessionMessagesIndex();
         dbPutMessage(next);
         return;
     }
@@ -2192,10 +2378,14 @@ export function updateChatMessage(
     if (idx === -1) return null;
 
     _messagesCache[idx] = { ..._messagesCache[idx], ...patch };
+    // 下标赋值：数组引用与长度都不变，必须显式作废会话索引，
+    // 否则列表里读到的还是更新前的旧消息对象（图片/语音状态不刷新）。
+    invalidateSessionMessagesIndex();
     const updated = _messagesCache[idx];
     dbPutMessage(updated);
 
-    const sessions = loadChatSessions();
+    // ForWrite：下面要改会话预览字段（见 loadChatSessionsForWrite 注释）。
+    const sessions = loadChatSessionsForWrite();
     const sessIdx = sessions.findIndex(s => s.id === updated.sessionId);
     if (sessIdx !== -1 && sessions[sessIdx].lastMessageId === updated.id) {
         sessions[sessIdx].lastMessagePreview = getChatMessagePreview(updated);
@@ -2304,6 +2494,9 @@ export function replaceMessageWithParts(
 
     // Remove original
     _messagesCache.splice(idx, 1);
+    // splice 原地改数组：净长度可能不变（1 条拆成 1 条），靠长度/引用判断脏会漏，
+    // 显式作废索引。
+    invalidateSessionMessagesIndex();
     dbDeleteMessage(originalId);
 
     // Insert parsed parts at the same position, preserving timestamp
@@ -2428,11 +2621,14 @@ export function replaceResponseBatchWithParts(
     const newMessages = toolCallMessage ? [...visibleMessages, toolCallMessage] : visibleMessages;
 
     _messagesCache.splice(insertIdx, 0, ...newMessages);
+    // 原地插入：显式作废会话索引（见 replaceMessageWithParts 的说明）。
+    invalidateSessionMessagesIndex();
     dbPutMessages(newMessages);
     reindexSessionMessageOrders(sessionId);
 
     const lastMsg = getLastVisibleSessionMessage(sessionId);
-    const sessions = loadChatSessions();
+    // ForWrite：要改会话字段，必须拿可改的副本（见 loadChatSessionsForWrite 注释）。
+    const sessions = loadChatSessionsForWrite();
     const sessIdx = sessions.findIndex(s => s.id === sessionId);
     if (sessIdx !== -1) {
         if (lastMsg) {
@@ -2527,11 +2723,14 @@ export function replaceGroupResponseRound(
     }));
 
     _messagesCache.splice(insertIdx, 0, ...newMessages);
+    // 原地插入：显式作废会话索引（见 replaceMessageWithParts 的说明）。
+    invalidateSessionMessagesIndex();
     dbPutMessages(newMessages);
     reindexSessionMessageOrders(sessionId);
 
     const lastMsg = getLastVisibleSessionMessage(sessionId);
-    const sessions = loadChatSessions();
+    // ForWrite：要改会话字段，必须拿可改的副本（见 loadChatSessionsForWrite 注释）。
+    const sessions = loadChatSessionsForWrite();
     const sessIdx = sessions.findIndex(s => s.id === sessionId);
     if (sessIdx !== -1) {
         if (lastMsg) {
