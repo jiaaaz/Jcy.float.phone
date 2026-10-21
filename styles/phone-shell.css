@@ -1032,7 +1032,7 @@
    距 20→5.13vw、图标 58→14.87vw、dock 354→90.77vw），窄屏呈现与正常
    手机完全相同的比例观感，无多余留白；网格/dock 同源，天然对齐。
    ≥374px 不受影响。 */
-@media (max-width: 373px) and (hover: none) and (pointer: coarse) {
+@media (max-width: 373px) {
   .icon-grid,
   .dock {
     --slot-size: 16.92vw;
@@ -1056,7 +1056,13 @@
 
 /* ── Mobile responsive ── */
 
-@media (max-width: 500px) and (hover: none) and (pointer: coarse) {
+/* 窄屏即手机壳布局。原来这条带 (hover: none) and (pointer: coarse) 双重门禁，
+   而这两个特性在真机上并不可靠：鸿蒙 ArkWeb / HarmonyOS NEXT 的内核、安卓的
+   「桌面版网站」开关、部分 WebView 会把 hover 报成 hover、pointer 报成 fine。
+   一旦如此，整块移动端适配被静默跳过 —— 于是 --phone-screen-width 仍是 390px
+   设计稿值、机身按桌面尺寸排布，比视口宽出几十像素，桌面整体向右溢出（拖动
+   才能看见被遮的部分）。宽度是唯一在所有内核上都可靠的信号。 */
+@media (max-width: 500px) {
 
   /* 用户在设置里显式开启「显示系统状态栏」且运行时不在全屏时，控制器才会挂
      data-pwa-display-mode 标记（见 pwa-manifest-injector）：此时所有 App 共用系统
@@ -1084,7 +1090,11 @@
   }
 
   :root {
-    --phone-screen-width: 100vw;
+    /* 100% 而不是 100vw：100vw 在部分内核里含滚动条宽度、且与 layout viewport
+       取整不一致，会比真正可用的宽度宽出几个像素。而 .app-root 是
+       overflow:hidden，多出来的那截直接裁掉，桌面整体向右偏移。
+       100% 始终等于父容器的可用宽度，不会溢出。 */
+    --phone-screen-width: 100%;
     --phone-screen-height: 100lvh;
   }
 
@@ -1097,7 +1107,7 @@
   }
 
   .app-root {
-    width: 100vw;
+    width: 100%;
     height: 100lvh;
     padding: 0;
     display: flex;
@@ -1114,7 +1124,11 @@
     --phone-screen-radius: 0px;
     --phone-frame-radius: 0px;
     --phone-case-radius: 0px;
-    width: var(--phone-screen-width);
+    /* 手机上机身即视口：宽度锁死 100%，不再走「设计稿宽度 + 8px 余量」那条
+       桌面公式（--phone-total-width + 8px 会让容器比视口宽 8px 以上，配合
+       .app-root 的 overflow:hidden 就是桌面整体偏右）。 */
+    width: 100%;
+    max-width: 100%;
     margin-inline: 0;
     gap: 0;
     transform-origin: top left;
@@ -1132,7 +1146,11 @@
     will-change: transform;
   }
 
+  /* 手机上机身外壳全部归零：宽度跟随 wrap 的 100%，否则 .phone-case 仍吃
+     桌面公式的 --phone-total-width（390 + 边框），比视口宽出几十像素。 */
   .phone-shell-wrap .phone-case {
+    width: 100%;
+    max-width: 100%;
     padding: 0;
     border: 0;
     background: transparent;
@@ -1145,6 +1163,8 @@
   }
 
   .phone-shell-wrap .phone-frame {
+    width: 100%;
+    max-width: 100%;
     padding: 0;
     background: transparent;
     box-shadow: none;
@@ -1156,7 +1176,7 @@
   }
 
   .app-root.splash-root {
-    width: 100vw;
+    width: 100%;
     height: 100lvh;
     margin: 0;
     padding: 0;
@@ -1168,13 +1188,15 @@
   }
 
   .splash-shell-wrap {
-    width: var(--phone-screen-width);
+    width: 100%;
+    max-width: 100%;
     transform-origin: top left;
   }
 
   .splash-shell-wrap .phone-case,
   .splash-shell-wrap .phone-frame {
-    width: var(--phone-screen-width);
+    width: 100%;
+    max-width: 100%;
   }
 }
 

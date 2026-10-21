@@ -1061,6 +1061,8 @@ function useAndroidNativeKeyboardViewport() {
     const root = document.documentElement;
     let raf = 0;
     let maxInnerHeight = window.innerHeight;
+    // 上次写入的高度。只在数值真的变了才写 —— 见下面 apply 里的说明。
+    let lastWritten = 0;
 
     const apply = () => {
       raf = 0;
@@ -1070,15 +1072,35 @@ function useAndroidNativeKeyboardViewport() {
       // innerHeight 明显小于历史最大值 = 键盘已让浏览器原生压缩布局视口。
       // 打上标记，供 useAndroidCaretKeyboardLift 关闭手动抬升，避免双重补偿产生中间空白。
       maxInnerHeight = Math.max(maxInnerHeight, window.innerHeight);
-      if (window.innerHeight < maxInnerHeight - 80) {
+      const keyboardUp = window.innerHeight < maxInnerHeight - 80;
+      if (keyboardUp) {
         root.dataset.nativeKbResize = "1";
       } else {
         delete root.dataset.nativeKbResize;
       }
+
+      // 只在**键盘真的弹起**时用像素高度覆盖 --phone-screen-height，键盘收起后
+      // 立刻撤掉覆盖，让 CSS 的 100lvh 重新接管。
+      //
+      // 旧实现无条件写入，而 --phone-screen-height 驱动的正是整台手机的高度
+      // （以及六个网格行的 1fr）：地址栏每次收放、每次滚动都会改写它，整个界面
+      // 随之连续重排，肉眼就是「打开后页面排布闪烁」。它还会和 CSS 里的 100lvh
+      // 来回夺权（两者取整不同），抖出 1~2px 的位移。
+      if (!keyboardUp) {
+        if (lastWritten !== 0) {
+          root.style.removeProperty("--phone-screen-height");
+          lastWritten = 0;
+        }
+        return;
+      }
+
       // 手机壳有 -status-bar-drop 的负 margin-top，高度补上这段才能让底栏贴住视口底/键盘顶
       const wrap = document.querySelector<HTMLElement>(".phone-shell-wrap");
       const drop = wrap ? (parseFloat(getComputedStyle(wrap).getPropertyValue("--status-bar-drop")) || 0) : 0;
-      root.style.setProperty("--phone-screen-height", `${Math.round(window.innerHeight + drop)}px`);
+      const next = Math.round(window.innerHeight + drop);
+      if (Math.abs(next - lastWritten) < 1) return;
+      lastWritten = next;
+      root.style.setProperty("--phone-screen-height", `${next}px`);
     };
 
     const requestApply = () => {
@@ -1089,6 +1111,7 @@ function useAndroidNativeKeyboardViewport() {
     const handleOrientationChange = () => {
       // 旋转屏幕时 innerHeight 基线会整体变化，重置后再按新方向判断
       maxInnerHeight = window.innerHeight;
+      lastWritten = 0;
       requestApply();
     };
 
